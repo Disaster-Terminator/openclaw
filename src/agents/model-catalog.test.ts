@@ -149,6 +149,8 @@ describe("loadModelCatalog", () => {
         provider: "openai",
         id: "gpt-5.4",
         name: "gpt-5.4",
+        contextWindow: 1_050_000,
+        maxTokens: 128_000,
       }),
     );
     expect(result).toContainEqual(
@@ -156,6 +158,8 @@ describe("loadModelCatalog", () => {
         provider: "openai",
         id: "gpt-5.4-pro",
         name: "gpt-5.4-pro",
+        contextWindow: 1_050_000,
+        maxTokens: 128_000,
       }),
     );
     expect(result).toContainEqual(
@@ -164,6 +168,7 @@ describe("loadModelCatalog", () => {
         id: "gpt-5.4",
         name: "gpt-5.4",
         contextWindow: 1_050_000,
+        maxTokens: 128_000,
       }),
     );
   });
