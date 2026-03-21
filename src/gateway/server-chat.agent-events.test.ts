@@ -136,6 +136,59 @@ describe("agent event handler", () => {
     });
   }
 
+  function emitLifecycleStart(
+    handler: ReturnType<typeof createHarness>["handler"],
+    runId: string,
+    seq = 1,
+  ) {
+    handler({
+      runId,
+      seq,
+      stream: "lifecycle",
+      ts: Date.now(),
+      data: { phase: "start" },
+    });
+  }
+
+  function emitAssistantText(params: {
+    handler: ReturnType<typeof createHarness>["handler"];
+    runId: string;
+    seq: number;
+    text: string;
+    delta?: string;
+  }) {
+    params.handler({
+      runId: params.runId,
+      seq: params.seq,
+      stream: "assistant",
+      ts: Date.now(),
+      data: {
+        text: params.text,
+        ...(params.delta === undefined ? {} : { delta: params.delta }),
+      },
+    });
+  }
+
+  function emitToolStart(params: {
+    handler: ReturnType<typeof createHarness>["handler"];
+    runId: string;
+    seq: number;
+    name?: string;
+    toolCallId?: string;
+  }) {
+    params.handler({
+      runId: params.runId,
+      seq: params.seq,
+      stream: "tool",
+      ts: Date.now(),
+      data: {
+        phase: "start",
+        name: params.name ?? "read",
+        toolCallId: params.toolCallId ?? `tool-${String(params.seq)}`,
+      },
+    });
+  }
+
   function emitFallbackLifecycle(params: {
     handler: ReturnType<typeof createHarness>["handler"];
     runId: string;
@@ -191,6 +244,30 @@ describe("agent event handler", () => {
     nowSpy?.mockRestore();
   });
 
+  it("ignores an initial assistant text + delta event when delta is not the full first chunk", () => {
+    const { broadcast, nodeSendToSession, chatRunState, handler, nowSpy } = createHarness({
+      now: 1_000,
+    });
+    chatRunState.registry.add("run-ambiguous-first", {
+      sessionKey: "session-ambiguous-first",
+      clientRunId: "client-ambiguous-first",
+    });
+
+    emitAssistantText({
+      handler,
+      runId: "run-ambiguous-first",
+      seq: 1,
+      text: "Hello world",
+      delta: " world",
+    });
+
+    expect(chatRunState.buffers.has("client-ambiguous-first")).toBe(false);
+    expect(chatRunState.lastAcceptedSeq.has("client-ambiguous-first")).toBe(false);
+    expect(chatBroadcastCalls(broadcast)).toHaveLength(0);
+    expect(sessionChatCalls(nodeSendToSession)).toHaveLength(0);
+    nowSpy?.mockRestore();
+  });
+
   it("strips inline directives from assistant chat events", () => {
     const { broadcast, nodeSendToSession, nowSpy } = emitRun1AssistantText(
       createHarness({ now: 1_000 }),
@@ -243,16 +320,18 @@ describe("agent event handler", () => {
     });
     chatRunState.registry.add("run-3", { sessionKey: "session-3", clientRunId: "client-3" });
 
+    let seq = 1;
     for (const text of ["NO", "NO_", "NO_RE", "NO_REPLY"]) {
       handler({
         runId: "run-3",
-        seq: 1,
+        seq,
         stream: "assistant",
         ts: Date.now(),
         data: { text },
       });
+      seq += 1;
     }
-    emitLifecycleEnd(handler, "run-3");
+    emitLifecycleEnd(handler, "run-3", seq);
 
     const payload = expectSingleFinalChatPayload(broadcast) as { message?: unknown };
     expect(payload.message).toBeUndefined();
@@ -303,7 +382,7 @@ describe("agent event handler", () => {
     now = 10_100;
     handler({
       runId: "run-flush",
-      seq: 1,
+      seq: 2,
       stream: "assistant",
       ts: Date.now(),
       data: { text: "Hello world" },
@@ -327,7 +406,67 @@ describe("agent event handler", () => {
     nowSpy.mockRestore();
   });
 
-  it("preserves pre-tool assistant text when later segments stream as non-prefix snapshots", () => {
+  it("flushes a same-length corrective snapshot before tool start after throttle suppression", () => {
+    let now = 10_250;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const {
+      broadcast,
+      broadcastToConnIds,
+      nodeSendToSession,
+      chatRunState,
+      toolEventRecipients,
+      handler,
+    } = createHarness({
+      resolveSessionKeyForRun: () => "session-same-length-correction",
+    });
+
+    chatRunState.registry.add("run-same-length-correction", {
+      sessionKey: "session-same-length-correction",
+      clientRunId: "client-same-length-correction",
+    });
+    registerAgentRunContext("run-same-length-correction", {
+      sessionKey: "session-same-length-correction",
+      verboseLevel: "off",
+    });
+    toolEventRecipients.add("run-same-length-correction", "conn-1");
+
+    emitAssistantText({
+      handler,
+      runId: "run-same-length-correction",
+      seq: 1,
+      text: "Hello world",
+    });
+
+    now = 10_320;
+    emitAssistantText({
+      handler,
+      runId: "run-same-length-correction",
+      seq: 2,
+      text: "Hello there",
+    });
+
+    now = 10_500;
+    emitToolStart({
+      handler,
+      runId: "run-same-length-correction",
+      seq: 3,
+      toolCallId: "tool-same-length-correction",
+    });
+
+    emitLifecycleEnd(handler, "run-same-length-correction", 4);
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    expect(chatCalls).toHaveLength(3);
+    const payloadTexts = chatCalls
+      .map(([, payload]) => payload as { message?: { content?: Array<{ text?: string }> } })
+      .map((payload) => payload.message?.content?.[0]?.text);
+    expect(payloadTexts).toEqual(["Hello world", "Hello there", "Hello there"]);
+    expect(sessionChatCalls(nodeSendToSession)).toHaveLength(3);
+    expect(broadcastToConnIds).toHaveBeenCalled();
+    nowSpy.mockRestore();
+  });
+
+  it("drops ambiguous non-prefix assistant chunks instead of appending them", () => {
     let now = 10_500;
     const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
     const { broadcast, nodeSendToSession, chatRunState, handler } = createHarness();
@@ -336,44 +475,38 @@ describe("agent event handler", () => {
       clientRunId: "client-segmented",
     });
 
-    handler({
+    emitAssistantText({
+      handler,
       runId: "run-segmented",
       seq: 1,
-      stream: "assistant",
-      ts: Date.now(),
-      data: { text: "Before tool call", delta: "Before tool call" },
+      text: "Before tool call",
+      delta: "Before tool call",
     });
 
     now = 10_700;
-    handler({
+    emitAssistantText({
+      handler,
       runId: "run-segmented",
       seq: 2,
-      stream: "assistant",
-      ts: Date.now(),
-      data: { text: "After tool call", delta: "\nAfter tool call" },
+      text: "After tool call",
+      delta: "\nAfter tool call",
     });
 
     emitLifecycleEnd(handler, "run-segmented", 3);
 
     const chatCalls = chatBroadcastCalls(broadcast);
-    expect(chatCalls).toHaveLength(3);
-    const secondPayload = chatCalls[1]?.[1] as {
+    expect(chatCalls).toHaveLength(2);
+    const finalPayload = chatCalls[1]?.[1] as {
       state?: string;
       message?: { content?: Array<{ text?: string }> };
     };
-    const finalPayload = chatCalls[2]?.[1] as {
-      state?: string;
-      message?: { content?: Array<{ text?: string }> };
-    };
-    expect(secondPayload.state).toBe("delta");
-    expect(secondPayload.message?.content?.[0]?.text).toBe("Before tool call\nAfter tool call");
     expect(finalPayload.state).toBe("final");
-    expect(finalPayload.message?.content?.[0]?.text).toBe("Before tool call\nAfter tool call");
-    expect(sessionChatCalls(nodeSendToSession)).toHaveLength(3);
+    expect(finalPayload.message?.content?.[0]?.text).toBe("Before tool call");
+    expect(sessionChatCalls(nodeSendToSession)).toHaveLength(2);
     nowSpy.mockRestore();
   });
 
-  it("flushes merged segmented text before final when latest segment is throttled", () => {
+  it("does not flush ambiguous non-prefix assistant chunks before final", () => {
     let now = 10_800;
     const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
     const { broadcast, nodeSendToSession, chatRunState, handler } = createHarness();
@@ -382,40 +515,34 @@ describe("agent event handler", () => {
       clientRunId: "client-segmented-flush",
     });
 
-    handler({
+    emitAssistantText({
+      handler,
       runId: "run-segmented-flush",
       seq: 1,
-      stream: "assistant",
-      ts: Date.now(),
-      data: { text: "Before tool call", delta: "Before tool call" },
+      text: "Before tool call",
+      delta: "Before tool call",
     });
 
     now = 10_860;
-    handler({
+    emitAssistantText({
+      handler,
       runId: "run-segmented-flush",
       seq: 2,
-      stream: "assistant",
-      ts: Date.now(),
-      data: { text: "After tool call", delta: "\nAfter tool call" },
+      text: "After tool call",
+      delta: "\nAfter tool call",
     });
 
     emitLifecycleEnd(handler, "run-segmented-flush", 3);
 
     const chatCalls = chatBroadcastCalls(broadcast);
-    expect(chatCalls).toHaveLength(3);
-    const flushPayload = chatCalls[1]?.[1] as {
+    expect(chatCalls).toHaveLength(2);
+    const finalPayload = chatCalls[1]?.[1] as {
       state?: string;
       message?: { content?: Array<{ text?: string }> };
     };
-    const finalPayload = chatCalls[2]?.[1] as {
-      state?: string;
-      message?: { content?: Array<{ text?: string }> };
-    };
-    expect(flushPayload.state).toBe("delta");
-    expect(flushPayload.message?.content?.[0]?.text).toBe("Before tool call\nAfter tool call");
     expect(finalPayload.state).toBe("final");
-    expect(finalPayload.message?.content?.[0]?.text).toBe("Before tool call\nAfter tool call");
-    expect(sessionChatCalls(nodeSendToSession)).toHaveLength(3);
+    expect(finalPayload.message?.content?.[0]?.text).toBe("Before tool call");
+    expect(sessionChatCalls(nodeSendToSession)).toHaveLength(2);
     nowSpy.mockRestore();
   });
 
@@ -428,21 +555,19 @@ describe("agent event handler", () => {
       clientRunId: "client-no-dup-flush",
     });
 
-    handler({
+    emitAssistantText({
+      handler,
       runId: "run-no-dup-flush",
       seq: 1,
-      stream: "assistant",
-      ts: Date.now(),
-      data: { text: "Hello" },
+      text: "Hello",
     });
 
     now = 11_200;
-    handler({
+    emitAssistantText({
+      handler,
       runId: "run-no-dup-flush",
-      seq: 1,
-      stream: "assistant",
-      ts: Date.now(),
-      data: { text: "Hello world" },
+      seq: 2,
+      text: "Hello world",
     });
 
     emitLifecycleEnd(handler, "run-no-dup-flush");
@@ -455,6 +580,344 @@ describe("agent event handler", () => {
       "final",
     ]);
     expect(sessionChatCalls(nodeSendToSession)).toHaveLength(3);
+    nowSpy.mockRestore();
+  });
+
+  it("ignores duplicate seq replay instead of regrowing the visible buffer", () => {
+    let now = 11_300;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, nodeSendToSession, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-replay", {
+      sessionKey: "session-replay",
+      clientRunId: "client-replay",
+    });
+
+    emitAssistantText({
+      handler,
+      runId: "run-replay",
+      seq: 1,
+      text: "Hello",
+    });
+
+    now = 11_500;
+    emitAssistantText({
+      handler,
+      runId: "run-replay",
+      seq: 1,
+      text: "HelloHello",
+    });
+
+    emitLifecycleEnd(handler, "run-replay", 2);
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    expect(chatCalls).toHaveLength(2);
+    const finalPayload = chatCalls[1]?.[1] as {
+      state?: string;
+      message?: { content?: Array<{ text?: string }> };
+    };
+    expect(finalPayload.state).toBe("final");
+    expect(finalPayload.message?.content?.[0]?.text).toBe("Hello");
+    expect(sessionChatCalls(nodeSendToSession)).toHaveLength(2);
+    nowSpy.mockRestore();
+  });
+
+  it("replaces with a non-prefix full snapshot instead of appending it", () => {
+    let now = 11_700;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, nodeSendToSession, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-replace", {
+      sessionKey: "session-replace",
+      clientRunId: "client-replace",
+    });
+
+    emitAssistantText({
+      handler,
+      runId: "run-replace",
+      seq: 1,
+      text: "Draft answer",
+    });
+
+    now = 11_900;
+    emitAssistantText({
+      handler,
+      runId: "run-replace",
+      seq: 2,
+      text: "Final rewritten answer",
+    });
+
+    emitLifecycleEnd(handler, "run-replace", 3);
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    expect(chatCalls).toHaveLength(3);
+    const secondPayload = chatCalls[1]?.[1] as {
+      message?: { content?: Array<{ text?: string }> };
+    };
+    const finalPayload = chatCalls[2]?.[1] as {
+      message?: { content?: Array<{ text?: string }> };
+    };
+    expect(secondPayload.message?.content?.[0]?.text).toBe("Final rewritten answer");
+    expect(finalPayload.message?.content?.[0]?.text).toBe("Final rewritten answer");
+    expect(sessionChatCalls(nodeSendToSession)).toHaveLength(3);
+    nowSpy.mockRestore();
+  });
+
+  it("enters recovery on seq gap and ignores ordinary assistant deltas until a full replacement arrives", () => {
+    let now = 12_100;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-gap", {
+      sessionKey: "session-gap",
+      clientRunId: "client-gap",
+    });
+
+    emitAssistantText({
+      handler,
+      runId: "run-gap",
+      seq: 1,
+      text: "Hello",
+    });
+    expect(chatRunState.waitingForRecovery.has("client-gap")).toBe(false);
+
+    now = 12_300;
+    emitAssistantText({
+      handler,
+      runId: "run-gap",
+      seq: 3,
+      text: "",
+      delta: " world",
+    });
+    expect(chatRunState.waitingForRecovery.has("client-gap")).toBe(true);
+    expect(chatRunState.buffers.get("client-gap")).toBe("Hello");
+
+    now = 12_500;
+    emitAssistantText({
+      handler,
+      runId: "run-gap",
+      seq: 4,
+      text: "",
+      delta: "!",
+    });
+    expect(chatRunState.buffers.get("client-gap")).toBe("Hello");
+
+    emitLifecycleEnd(handler, "run-gap", 5);
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    expect(chatCalls).toHaveLength(2);
+    const finalPayload = chatCalls[1]?.[1] as {
+      message?: { content?: Array<{ text?: string }> };
+    };
+    expect(finalPayload.message?.content?.[0]?.text).toBe("Hello");
+    nowSpy.mockRestore();
+  });
+
+  it("recovers from a missed first assistant chunk when the next ACP snapshot is cumulative", () => {
+    let now = 12_850;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-first-gap", {
+      sessionKey: "session-first-gap",
+      clientRunId: "client-first-gap",
+    });
+
+    emitLifecycleStart(handler, "run-first-gap", 1);
+
+    now = 13_050;
+    emitAssistantText({
+      handler,
+      runId: "run-first-gap",
+      seq: 3,
+      text: "Hello world",
+      delta: " world",
+    });
+
+    expect(chatRunState.waitingForRecovery.has("client-first-gap")).toBe(false);
+    expect(chatRunState.buffers.get("client-first-gap")).toBe("Hello world");
+
+    emitLifecycleEnd(handler, "run-first-gap", 4);
+
+    const payloadTexts = chatBroadcastCalls(broadcast)
+      .map(([, payload]) => payload as { message?: { content?: Array<{ text?: string }> } })
+      .map((payload) => payload.message?.content?.[0]?.text);
+    expect(payloadTexts).toEqual(["Hello world", "Hello world"]);
+    nowSpy.mockRestore();
+  });
+
+  it("gap recovery does not accept empty-base text equals delta as full replacement", () => {
+    let now = 12_860;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-gap-empty-base-mirrored", {
+      sessionKey: "session-gap-empty-base-mirrored",
+      clientRunId: "client-gap-empty-base-mirrored",
+    });
+
+    emitLifecycleStart(handler, "run-gap-empty-base-mirrored", 1);
+
+    now = 13_060;
+    emitAssistantText({
+      handler,
+      runId: "run-gap-empty-base-mirrored",
+      seq: 3,
+      text: " world",
+      delta: " world",
+    });
+
+    expect(chatRunState.waitingForRecovery.has("client-gap-empty-base-mirrored")).toBe(true);
+    expect(chatRunState.buffers.get("client-gap-empty-base-mirrored")).toBeUndefined();
+    expect(chatBroadcastCalls(broadcast)).toHaveLength(0);
+
+    now = 13_260;
+    emitAssistantText({
+      handler,
+      runId: "run-gap-empty-base-mirrored",
+      seq: 4,
+      text: "Hello world",
+      delta: " world",
+    });
+
+    expect(chatRunState.waitingForRecovery.has("client-gap-empty-base-mirrored")).toBe(false);
+    expect(chatRunState.buffers.get("client-gap-empty-base-mirrored")).toBe("Hello world");
+    expect(chatRunState.lastAcceptedSeq.get("client-gap-empty-base-mirrored")).toBe(4);
+    nowSpy.mockRestore();
+  });
+
+  it("does not treat the first assistant text after lifecycle start as a gap", () => {
+    let now = 12_600;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-start-gap", {
+      sessionKey: "session-start-gap",
+      clientRunId: "client-start-gap",
+    });
+
+    emitLifecycleStart(handler, "run-start-gap", 1);
+
+    now = 12_800;
+    emitAssistantText({
+      handler,
+      runId: "run-start-gap",
+      seq: 2,
+      text: "Hello from start",
+    });
+
+    expect(chatRunState.waitingForRecovery.has("client-start-gap")).toBe(false);
+    expect(chatRunState.buffers.get("client-start-gap")).toBe("Hello from start");
+
+    emitLifecycleEnd(handler, "run-start-gap", 3);
+
+    const payloadTexts = chatBroadcastCalls(broadcast)
+      .map(([, payload]) => payload as { message?: { content?: Array<{ text?: string }> } })
+      .map((payload) => payload.message?.content?.[0]?.text);
+    expect(payloadTexts).toEqual(["Hello from start", "Hello from start"]);
+    nowSpy.mockRestore();
+  });
+
+  it("does not treat seen tool and lifecycle events between assistant updates as a chat gap", () => {
+    let now = 12_900;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-interleaved", {
+      sessionKey: "session-interleaved",
+      clientRunId: "client-interleaved",
+    });
+
+    emitAssistantText({
+      handler,
+      runId: "run-interleaved",
+      seq: 1,
+      text: "Hello",
+    });
+
+    now = 13_100;
+    emitToolStart({
+      handler,
+      runId: "run-interleaved",
+      seq: 2,
+      toolCallId: "tool-interleaved",
+    });
+
+    now = 13_300;
+    emitFallbackLifecycle({
+      handler,
+      runId: "run-interleaved",
+      seq: 3,
+    });
+
+    now = 13_500;
+    emitAssistantText({
+      handler,
+      runId: "run-interleaved",
+      seq: 4,
+      text: "",
+      delta: " world",
+    });
+
+    expect(chatRunState.waitingForRecovery.has("client-interleaved")).toBe(false);
+    expect(chatRunState.buffers.get("client-interleaved")).toBe("Hello world");
+
+    emitLifecycleEnd(handler, "run-interleaved", 5);
+
+    const payloadTexts = chatBroadcastCalls(broadcast)
+      .map(([, payload]) => payload as { message?: { content?: Array<{ text?: string }> } })
+      .map((payload) => payload.message?.content?.[0]?.text);
+    expect(payloadTexts).toEqual(["Hello", "Hello world", "Hello world"]);
+    nowSpy.mockRestore();
+  });
+
+  it("drops assistant chunks older than highest seen seq and waits for a safe recovery snapshot", () => {
+    let now = 13_650;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-delayed-older", {
+      sessionKey: "session-delayed-older",
+      clientRunId: "client-delayed-older",
+    });
+
+    emitAssistantText({
+      handler,
+      runId: "run-delayed-older",
+      seq: 1,
+      text: "Hello",
+    });
+
+    now = 13_850;
+    emitToolStart({
+      handler,
+      runId: "run-delayed-older",
+      seq: 3,
+      toolCallId: "tool-delayed-older",
+    });
+
+    now = 14_050;
+    emitAssistantText({
+      handler,
+      runId: "run-delayed-older",
+      seq: 2,
+      text: "Hello world",
+    });
+
+    expect(chatRunState.waitingForRecovery.has("client-delayed-older")).toBe(true);
+    expect(chatRunState.buffers.get("client-delayed-older")).toBe("Hello");
+    expect(chatRunState.lastAcceptedSeq.get("client-delayed-older")).toBe(1);
+
+    now = 14_250;
+    emitAssistantText({
+      handler,
+      runId: "run-delayed-older",
+      seq: 4,
+      text: "Hello world!",
+    });
+
+    expect(chatRunState.waitingForRecovery.has("client-delayed-older")).toBe(false);
+    expect(chatRunState.buffers.get("client-delayed-older")).toBe("Hello world!");
+    expect(chatRunState.lastAcceptedSeq.get("client-delayed-older")).toBe(4);
+
+    emitLifecycleEnd(handler, "run-delayed-older", 5);
+
+    const payloadTexts = chatBroadcastCalls(broadcast)
+      .map(([, payload]) => payload as { message?: { content?: Array<{ text?: string }> } })
+      .map((payload) => payload.message?.content?.[0]?.text);
+    expect(payloadTexts).toEqual(["Hello", "Hello world!", "Hello world!"]);
     nowSpy.mockRestore();
   });
 
@@ -472,7 +935,7 @@ describe("agent event handler", () => {
       ts: Date.now(),
       data: { text: "done" },
     });
-    expect(agentRunSeq.get("run-cleanup")).toBe(1);
+    expect(agentRunSeq.get("client-cleanup")).toBe(1);
 
     handler({
       runId: "run-cleanup",
