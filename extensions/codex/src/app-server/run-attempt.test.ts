@@ -576,6 +576,30 @@ describe("runCodexAppServerAttempt", () => {
     );
   });
 
+  it("leaves Codex native hooks disabled by default", async () => {
+    const sessionFile = path.join(tempDir, "session.jsonl");
+    const workspaceDir = path.join(tempDir, "workspace");
+    const harness = createStartedThreadHarness();
+
+    const run = runCodexAppServerAttempt(createParams(sessionFile, workspaceDir));
+    await harness.waitForMethod("turn/start");
+    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+    await run;
+
+    const startRequest = harness.requests.find((request) => request.method === "thread/start");
+    expect(startRequest?.params).toEqual(
+      expect.objectContaining({
+        config: {
+          "features.codex_hooks": false,
+          "hooks.PreToolUse": [],
+          "hooks.PostToolUse": [],
+          "hooks.PermissionRequest": [],
+          "hooks.Stop": [],
+        },
+      }),
+    );
+  });
+
   it("cleans up native hook relay state when turn/start fails", async () => {
     const sessionFile = path.join(tempDir, "session.jsonl");
     const workspaceDir = path.join(tempDir, "workspace");

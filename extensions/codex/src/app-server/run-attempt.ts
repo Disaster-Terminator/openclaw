@@ -303,9 +303,7 @@ export async function runCodexAppServerAttempt(
           events: options.nativeHookRelay?.events,
           hookTimeoutSec: options.nativeHookRelay?.hookTimeoutSec,
         })
-      : options.nativeHookRelay?.enabled === false
-        ? buildCodexNativeHookRelayDisabledConfig()
-        : undefined;
+      : buildCodexNativeHookRelayDisabledConfig();
     ({ client, thread } = await withCodexStartupTimeout({
       timeoutMs: params.timeoutMs,
       timeoutFloorMs: options.startupTimeoutFloorMs,
@@ -794,7 +792,7 @@ function createCodexNativeHookRelay(params: {
   runId: string;
   signal: AbortSignal;
 }): NativeHookRelayRegistrationHandle | undefined {
-  if (params.options?.enabled === false) {
+  if (params.options?.enabled !== true) {
     return undefined;
   }
   return registerNativeHookRelay({
