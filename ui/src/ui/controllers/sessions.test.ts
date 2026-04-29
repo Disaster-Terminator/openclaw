@@ -38,6 +38,7 @@ function createState(request: RequestFn, overrides: Partial<SessionsState> = {})
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -50,6 +51,72 @@ describe("subscribeSessions", () => {
 
     expect(request).toHaveBeenCalledWith("sessions.subscribe", {});
     expect(state.sessionsError).toBeNull();
+  });
+
+  it("retries when the session subscription request fails", async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    const request = vi.fn(async (method: string) => {
+      if (method !== "sessions.subscribe") {
+        throw new Error(`unexpected method: ${method}`);
+      }
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("temporary disconnect");
+      }
+      return { subscribed: true };
+    });
+    const state = createState(request);
+
+    await subscribeSessions(state);
+
+    expect(state.sessionsSubscribed).toBe(false);
+    expect(state.sessionsError).toBe("Error: temporary disconnect");
+    expect(request).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(state.sessionsSubscribed).toBe(true);
+    expect(state.sessionsError).toBeNull();
+  });
+
+  it("does not retry a failed subscription after disconnect", async () => {
+    vi.useFakeTimers();
+    const request = vi.fn(async () => {
+      throw new Error("gateway closed");
+    });
+    const state = createState(request);
+
+    await subscribeSessions(state);
+    state.connected = false;
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("loadSessions", () => {
+  it("opportunistically restores the session subscription before listing", async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === "sessions.subscribe") {
+        return { subscribed: true };
+      }
+      if (method === "sessions.list") {
+        return { ts: 1, count: 0, sessions: [] };
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const state = createState(request, { sessionsSubscribed: false });
+
+    await loadSessions(state);
+
+    expect(request).toHaveBeenCalledWith("sessions.subscribe", {});
+    expect(request).toHaveBeenCalledWith("sessions.list", {
+      includeGlobal: true,
+      includeUnknown: true,
+    });
+    expect(state.sessionsSubscribed).toBe(true);
   });
 });
 

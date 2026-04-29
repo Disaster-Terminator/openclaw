@@ -43,6 +43,9 @@ vi.mock("./gateway.ts", async (importOriginal) => {
     readonly start = vi.fn();
     readonly stop = vi.fn();
     readonly request = vi.fn(async (method: string) => {
+      if (method === "sessions.subscribe") {
+        return { subscribed: true };
+      }
       if (method === "update.status") {
         return { sentinel: null };
       }

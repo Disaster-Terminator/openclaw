@@ -103,6 +103,7 @@ type GatewayHost = {
   chatRunId: string | null;
   pendingAbort?: { runId: string; sessionKey: string } | null;
   refreshSessionsAfterChat: Set<string>;
+  sessionsSubscribed?: boolean;
   execApprovalQueue: ExecApprovalRequest[];
   execApprovalError: string | null;
   updateAvailable: UpdateAvailable | null;
@@ -428,6 +429,7 @@ export function connectGateway(host: GatewayHost, options?: ConnectGatewayOption
       host.lastError = null;
       host.lastErrorCode = null;
       host.hello = hello;
+      host.sessionsSubscribed = false;
       applySnapshot(host, hello);
       void loadControlUiBootstrapConfig(
         host as unknown as Parameters<typeof loadControlUiBootstrapConfig>[0],

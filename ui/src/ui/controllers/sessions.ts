@@ -16,6 +16,7 @@ import {
 export type SessionsState = {
   client: GatewayBrowserClient | null;
   connected: boolean;
+  sessionsSubscribed?: boolean;
   sessionsLoading: boolean;
   sessionsResult: SessionsListResult | null;
   sessionsError: string | null;
@@ -44,6 +45,56 @@ type SessionsLoadControl = {
 };
 
 const sessionsLoadControls = new WeakMap<object, SessionsLoadControl>();
+const SESSION_SUBSCRIBE_RETRY_DELAYS_MS = [500, 1_500, 5_000] as const;
+
+type SessionsSubscribeControl = {
+  client: GatewayBrowserClient | null;
+  inFlight: Promise<void> | null;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+  retryAttempt: number;
+};
+
+const sessionsSubscribeControls = new WeakMap<object, SessionsSubscribeControl>();
+
+function getSessionsSubscribeControl(state: SessionsState): SessionsSubscribeControl {
+  const key = state as object;
+  let control = sessionsSubscribeControls.get(key);
+  if (!control) {
+    control = {
+      client: null,
+      inFlight: null,
+      retryTimer: null,
+      retryAttempt: 0,
+    };
+    sessionsSubscribeControls.set(key, control);
+  }
+  if (control.client !== state.client) {
+    if (control.retryTimer) {
+      clearTimeout(control.retryTimer);
+    }
+    control.client = state.client;
+    control.inFlight = null;
+    control.retryTimer = null;
+    control.retryAttempt = 0;
+    state.sessionsSubscribed = false;
+  }
+  return control;
+}
+
+function scheduleSessionsSubscribeRetry(state: SessionsState, control: SessionsSubscribeControl) {
+  if (!state.client || !state.connected || control.client !== state.client || control.retryTimer) {
+    return;
+  }
+  const delay =
+    SESSION_SUBSCRIBE_RETRY_DELAYS_MS[
+      Math.min(control.retryAttempt, SESSION_SUBSCRIBE_RETRY_DELAYS_MS.length - 1)
+    ];
+  control.retryAttempt += 1;
+  control.retryTimer = setTimeout(() => {
+    control.retryTimer = null;
+    void subscribeSessions(state);
+  }, delay);
+}
 
 const SESSION_EVENT_ROW_FIELDS = [
   "abortedLastRun",
@@ -281,16 +332,54 @@ export async function subscribeSessions(state: SessionsState) {
   if (!state.client || !state.connected) {
     return;
   }
-  try {
-    await state.client.request("sessions.subscribe", {});
-  } catch (err) {
-    state.sessionsError = String(err);
+  const client = state.client;
+  const control = getSessionsSubscribeControl(state);
+  if (state.sessionsSubscribed && control.client === client) {
+    return;
   }
+  if (control.inFlight) {
+    return control.inFlight;
+  }
+  if (control.retryTimer) {
+    clearTimeout(control.retryTimer);
+    control.retryTimer = null;
+  }
+  const request = async () => {
+    try {
+      const res = await client.request<{ subscribed?: boolean }>("sessions.subscribe", {});
+      if (state.client !== client || !state.connected) {
+        return;
+      }
+      if (res?.subscribed !== true) {
+        throw new Error("sessions.subscribe returned subscribed=false");
+      }
+      state.sessionsSubscribed = true;
+      state.sessionsError = null;
+      control.retryAttempt = 0;
+    } catch (err) {
+      if (state.client !== client || !state.connected) {
+        return;
+      }
+      state.sessionsSubscribed = false;
+      state.sessionsError = String(err);
+      scheduleSessionsSubscribeRetry(state, control);
+    } finally {
+      if (control.inFlight === requestPromise) {
+        control.inFlight = null;
+      }
+    }
+  };
+  const requestPromise = request();
+  control.inFlight = requestPromise;
+  return requestPromise;
 }
 
 export async function loadSessions(state: SessionsState, overrides?: LoadSessionsOverrides) {
   if (!state.client || !state.connected) {
     return;
+  }
+  if (state.sessionsSubscribed === false) {
+    void subscribeSessions(state);
   }
   const control = getSessionsLoadControl(state);
   if (control.loading) {
