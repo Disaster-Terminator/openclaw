@@ -467,6 +467,18 @@ export async function runCodexAppServerAttempt(
     if (!call || call.threadId !== thread.threadId || call.turnId !== turnId) {
       return undefined;
     }
+    emitCodexAppServerEvent(params, {
+      stream: "tool",
+      data: {
+        phase: "start",
+        backend: "codex-app-server",
+        threadId: call.threadId,
+        turnId: call.turnId,
+        toolCallId: call.callId,
+        name: call.tool,
+        args: call.arguments,
+      },
+    });
     trajectoryRecorder?.recordEvent("tool.call", {
       threadId: call.threadId,
       turnId: call.turnId,
@@ -475,6 +487,21 @@ export async function runCodexAppServerAttempt(
       arguments: call.arguments,
     });
     const response = await toolBridge.handleToolCall(call);
+    emitCodexAppServerEvent(params, {
+      stream: "tool",
+      data: {
+        phase: "result",
+        backend: "codex-app-server",
+        threadId: call.threadId,
+        turnId: call.turnId,
+        toolCallId: call.callId,
+        name: call.tool,
+        result: {
+          success: response.success,
+          contentItems: response.contentItems,
+        },
+      },
+    });
     trajectoryRecorder?.recordEvent("tool.result", {
       threadId: call.threadId,
       turnId: call.turnId,

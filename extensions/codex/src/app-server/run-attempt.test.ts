@@ -149,6 +149,11 @@ function createAppServerHarness(
 ) {
   const requests: Array<{ method: string; params: unknown }> = [];
   let notify: (notification: CodexServerNotification) => Promise<void> = async () => undefined;
+  let handleServerRequest: (request: {
+    id: string | number;
+    method: string;
+    params?: unknown;
+  }) => Promise<unknown> = async () => undefined;
   const request = vi.fn(async (method: string, params?: unknown) => {
     requests.push({ method, params });
     return requestImpl(method, params);
@@ -162,7 +167,10 @@ function createAppServerHarness(
         notify = handler;
         return () => undefined;
       },
-      addRequestHandler: () => () => undefined,
+      addRequestHandler: (handler: typeof handleServerRequest) => {
+        handleServerRequest = handler;
+        return () => undefined;
+      },
     } as never;
   });
 
@@ -176,6 +184,9 @@ function createAppServerHarness(
     },
     async notify(notification: CodexServerNotification) {
       await notify(notification);
+    },
+    async requestFromServer(request: { id: string | number; method: string; params?: unknown }) {
+      return await handleServerRequest(request);
     },
     async completeTurn(params: { threadId: string; turnId: string }) {
       await notify({
@@ -507,6 +518,97 @@ describe("runCodexAppServerAttempt", () => {
         runId: "run-1",
         sessionId: "session-1",
       }),
+    );
+  });
+
+  it("publishes dynamic tool request calls to the agent tool stream", async () => {
+    const onRunAgentEvent = vi.fn();
+    const globalAgentEvents: AgentEventPayload[] = [];
+    onAgentEvent((event) => globalAgentEvents.push(event));
+    const sessionFile = path.join(tempDir, "session.jsonl");
+    const workspaceDir = path.join(tempDir, "workspace");
+    const harness = createStartedThreadHarness();
+
+    const params = createParams(sessionFile, workspaceDir);
+    params.onAgentEvent = onRunAgentEvent;
+    const run = runCodexAppServerAttempt(params);
+    await harness.waitForMethod("turn/start");
+
+    const response = await harness.requestFromServer({
+      id: "request-1",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-read-1",
+        namespace: null,
+        tool: "read",
+        arguments: { path: "README.md" },
+      },
+    });
+
+    expect(response).toEqual({
+      contentItems: [{ type: "inputText", text: "Unknown OpenClaw tool: read" }],
+      success: false,
+    });
+    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+    await run;
+
+    const agentEvents = onRunAgentEvent.mock.calls.map(([event]) => event);
+    expect(agentEvents).toEqual(
+      expect.arrayContaining([
+        {
+          stream: "tool",
+          data: {
+            phase: "start",
+            backend: "codex-app-server",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            toolCallId: "call-read-1",
+            name: "read",
+            args: { path: "README.md" },
+          },
+        },
+        {
+          stream: "tool",
+          data: {
+            phase: "result",
+            backend: "codex-app-server",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            toolCallId: "call-read-1",
+            name: "read",
+            result: {
+              success: false,
+              contentItems: [{ type: "inputText", text: "Unknown OpenClaw tool: read" }],
+            },
+          },
+        },
+      ]),
+    );
+    expect(globalAgentEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          runId: "run-1",
+          sessionKey: "agent:main:session-1",
+          stream: "tool",
+          data: expect.objectContaining({
+            phase: "start",
+            toolCallId: "call-read-1",
+            name: "read",
+          }),
+        }),
+        expect.objectContaining({
+          runId: "run-1",
+          sessionKey: "agent:main:session-1",
+          stream: "tool",
+          data: expect.objectContaining({
+            phase: "result",
+            toolCallId: "call-read-1",
+            name: "read",
+          }),
+        }),
+      ]),
     );
   });
 
