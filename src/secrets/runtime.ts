@@ -267,7 +267,16 @@ export async function prepareSecretsRuntimeSnapshot(params: {
   /** Test override for discovered loadable plugins and their origins. */
   loadablePluginOrigins?: ReadonlyMap<string, PluginOrigin>;
 }): Promise<PreparedSecretsRuntimeSnapshot> {
+  const debugSecretsStartup =
+    (params.env ?? process.env).OPENCLAW_SECRETS_RUNTIME_DEBUG === "1";
+  const debugStart = Date.now();
+  const debugLog = (label: string) => {
+    if (debugSecretsStartup) {
+      console.error(`[secrets-runtime-debug] ${label} ${Date.now() - debugStart}ms`);
+    }
+  };
   const runtimeEnv = mergeSecretsRuntimeEnv(params.env);
+  debugLog("env");
   const sourceConfig = structuredClone(params.config);
   const resolvedConfig = structuredClone(params.config);
   const includeAuthStoreRefs = params.includeAuthStoreRefs ?? true;
@@ -284,6 +293,7 @@ export async function prepareSecretsRuntimeSnapshot(params: {
       });
     }
   }
+  debugLog("auth-stores-fast");
   if (canUseSecretsRuntimeFastPath({ sourceConfig, authStores })) {
     const snapshot = {
       sourceConfig,
@@ -309,11 +319,15 @@ export async function prepareSecretsRuntimeSnapshot(params: {
     resolveRuntimeWebTools,
     resolveSecretRefValues,
   } = await loadRuntimePrepareHelpers();
+  debugLog("helpers");
   const loadablePluginOrigins =
     params.loadablePluginOrigins ??
-    (hasConfiguredPluginEntries(sourceConfig)
+    (runtimeEnv.OPENCLAW_SECRETS_SKIP_PLUGIN_ORIGINS === "1"
+      ? new Map<string, PluginOrigin>()
+      : hasConfiguredPluginEntries(sourceConfig)
       ? await resolveLoadablePluginOrigins({ config: sourceConfig, env: runtimeEnv })
       : new Map<string, PluginOrigin>());
+  debugLog("plugin-origins");
   const context = createResolverContext({
     sourceConfig,
     env: runtimeEnv,
@@ -324,6 +338,7 @@ export async function prepareSecretsRuntimeSnapshot(params: {
     context,
     loadablePluginOrigins,
   });
+  debugLog("config-assignments");
 
   if (includeAuthStoreRefs) {
     const loadAuthStore = params.loadAuthStore ?? loadAuthProfileStoreForSecretsRuntime;
@@ -341,6 +356,7 @@ export async function prepareSecretsRuntimeSnapshot(params: {
       });
     }
   }
+  debugLog("auth-store-assignments");
 
   if (context.assignments.length > 0) {
     const refs = context.assignments.map((assignment) => assignment.ref);
@@ -354,18 +370,23 @@ export async function prepareSecretsRuntimeSnapshot(params: {
       resolved,
     });
   }
+  debugLog("secret-values");
 
   const snapshot = {
     sourceConfig,
     config: resolvedConfig,
     authStores,
     warnings: context.warnings,
-    webTools: await resolveRuntimeWebTools({
-      sourceConfig,
-      resolvedConfig,
-      context,
-    }),
+    webTools:
+      runtimeEnv.OPENCLAW_SECRETS_SKIP_RUNTIME_WEB_TOOLS === "1"
+        ? createEmptyRuntimeWebToolsMetadata()
+        : await resolveRuntimeWebTools({
+            sourceConfig,
+            resolvedConfig,
+            context,
+          }),
   };
+  debugLog("web-tools");
   preparedSnapshotRefreshContext.set(snapshot, {
     env: runtimeEnv,
     explicitAgentDirs: params.agentDirs?.length ? [...candidateDirs] : null,

@@ -1,4 +1,4 @@
-import MarkdownIt from "markdown-it";
+import MarkdownIt from "markdown-it/dist/index.cjs.js";
 import { chunkText } from "../auto-reply/chunk.js";
 import type { MarkdownTableMode } from "../config/types.base.js";
 
