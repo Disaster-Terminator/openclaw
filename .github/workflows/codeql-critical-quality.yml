@@ -2,8 +2,6 @@ name: CodeQL Critical Quality
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "30 6 * * *"
 
 concurrency:
   group: codeql-critical-quality-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.sha }}
