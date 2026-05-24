@@ -1,11 +1,12 @@
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildFileEntry,
   buildMultimodalChunkForIndexing,
   chunkMarkdown,
+  ensureDir,
   isMemoryPath,
   listMemoryFiles,
   normalizeExtraMemoryPaths,
@@ -32,6 +33,10 @@ afterAll(() => {
   if (sharedTempRoot) {
     fsSync.rmSync(sharedTempRoot, { recursive: true, force: true });
   }
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 function setupTempDirLifecycle(prefix: string): () => string {
@@ -77,12 +82,36 @@ const multimodal: MemoryMultimodalSettings = {
 describe("memory host SDK package internals", () => {
   const getTmpDir = setupTempDirLifecycle("memory-package-");
 
+  it("propagates directory creation failures", () => {
+    const mkdirError = new Error("disk full");
+    const targetDir = path.join(getTmpDir(), "blocked");
+    const mkdirSync = vi.spyOn(fsSync, "mkdirSync").mockImplementation(() => {
+      throw mkdirError;
+    });
+
+    expect(() => ensureDir(targetDir)).toThrow(mkdirError);
+    expect(mkdirSync).toHaveBeenCalledWith(targetDir, { recursive: true });
+  });
+
   it("normalizes additional memory paths", () => {
     const workspaceDir = path.join(os.tmpdir(), "memory-test-workspace");
     const absPath = path.resolve(path.sep, "shared-notes");
     expect(
-      normalizeExtraMemoryPaths(workspaceDir, [" notes ", "./notes", absPath, absPath, ""]),
-    ).toEqual([path.resolve(workspaceDir, "notes"), absPath]);
+      normalizeExtraMemoryPaths(workspaceDir, [
+        " notes ",
+        "./notes",
+        absPath,
+        absPath,
+        "~/shared-notes",
+        "~",
+        "",
+      ]),
+    ).toEqual([
+      path.resolve(workspaceDir, "notes"),
+      absPath,
+      path.join(os.homedir(), "shared-notes"),
+      os.homedir(),
+    ]);
   });
 
   it("lists canonical markdown and enabled multimodal files", async () => {
@@ -123,14 +152,15 @@ describe("memory host SDK package internals", () => {
     const note = await buildFileEntry(notePath, tmpDir);
     const image = await buildFileEntry(imagePath, tmpDir, multimodal);
 
-    expect(note).toMatchObject({ path: "note.md", kind: "markdown" });
-    expect(image).toMatchObject({
-      path: "diagram.png",
-      kind: "multimodal",
-      modality: "image",
-      mimeType: "image/png",
-      contentText: "Image file: diagram.png",
-    });
+    const noteEntry = expectFileEntry(note);
+    expect(noteEntry.path).toBe("note.md");
+    expect(noteEntry.kind).toBe("markdown");
+    const imageEntry = expectFileEntry(image);
+    expect(imageEntry.path).toBe("diagram.png");
+    expect(imageEntry.kind).toBe("multimodal");
+    expect(imageEntry.modality).toBe("image");
+    expect(imageEntry.mimeType).toBe("image/png");
+    expect(imageEntry.contentText).toBe("Image file: diagram.png");
   });
 
   it("builds multimodal chunks lazily and rejects changed files", async () => {
@@ -140,10 +170,13 @@ describe("memory host SDK package internals", () => {
 
     const entry = expectFileEntry(await buildFileEntry(imagePath, tmpDir, multimodal));
     const built = expectMultimodalIndexingChunk(await buildMultimodalChunkForIndexing(entry));
-    expect(expectEmbeddingInput(built.chunk).parts).toEqual([
-      { type: "text", text: "Image file: diagram.png" },
-      expect.objectContaining({ type: "inline-data", mimeType: "image/png" }),
-    ]);
+    const parts = expectEmbeddingInput(built.chunk).parts ?? [];
+    expect(parts[0]).toEqual({ type: "text", text: "Image file: diagram.png" });
+    const inlinePart = parts[1];
+    if (inlinePart?.type !== "inline-data") {
+      throw new Error("Expected multimodal inline-data embedding part");
+    }
+    expect(inlinePart.mimeType).toBe("image/png");
 
     fsSync.writeFileSync(imagePath, Buffer.alloc(entry.size + 32, 1));
     await expect(buildMultimodalChunkForIndexing(entry)).resolves.toBeNull();

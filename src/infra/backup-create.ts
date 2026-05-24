@@ -25,6 +25,18 @@ function loadTarRuntime(): Promise<TarRuntime> {
   return tarRuntimePromise;
 }
 
+type BackupLinkCacheKey = `${number}:${number}`;
+
+class BackupLinkCache extends Map<BackupLinkCacheKey, string> {
+  override get(_key: BackupLinkCacheKey): undefined {
+    return undefined;
+  }
+
+  override set(_key: BackupLinkCacheKey, _value: string): this {
+    return this;
+  }
+}
+
 export type BackupCreateOptions = {
   output?: string;
   dryRun?: boolean;
@@ -172,7 +184,8 @@ async function writeTarArchiveWithRetry(params: {
   throw new Error(`Backup archive write failed: ${final.message}${suffix}`, { cause: final });
 }
 
-export const __test = { writeTarArchiveWithRetry, isTarEofRaceError };
+export const testApi = { writeTarArchiveWithRetry, isTarEofRaceError };
+export { testApi as __test };
 
 async function resolveOutputPath(params: {
   output?: string;
@@ -224,6 +237,43 @@ async function assertOutputPathReady(outputPath: string): Promise<void> {
 
 function buildTempArchivePath(outputPath: string): string {
   return `${outputPath}.${randomUUID()}.tmp`;
+}
+
+// The temp manifest is passed to `tar.c` alongside the asset source paths. If
+// the temp file lives inside any asset, recursive traversal pulls it in a
+// second time and both copies remap to `<archiveRoot>/manifest.json`, which
+// makes verify reject the archive. A `tar` filter cannot fix this in place: it
+// fires for both the explicit-arg and the traversed entry, so excluding by
+// path drops the manifest entirely. We instead place the temp dir somewhere
+// guaranteed to be outside every asset.
+async function chooseBackupTempRoot(params: {
+  assets: readonly BackupAsset[];
+  outputPath: string;
+}): Promise<string> {
+  const systemTmp = os.tmpdir();
+  const canonicalSystemTmp = await canonicalizePathForContainment(systemTmp);
+  const systemTmpInsideAsset = params.assets.some((asset) =>
+    isPathWithin(canonicalSystemTmp, asset.sourcePath),
+  );
+  if (!systemTmpInsideAsset) {
+    return systemTmp;
+  }
+
+  // Fallback: the directory holding the output archive. The earlier
+  // output-containment check guarantees `outputPath` is outside every asset,
+  // so its parent is too. The caller must already have write access there to
+  // write the archive itself, so this stays within the existing sandbox.
+  const fallback = path.dirname(params.outputPath);
+  const canonicalFallback = await canonicalizePathForContainment(fallback);
+  const fallbackInsideAsset = params.assets.find((asset) =>
+    isPathWithin(canonicalFallback, asset.sourcePath),
+  );
+  if (fallbackInsideAsset) {
+    throw new Error(
+      `Backup temp root cannot be placed outside every source path: ${systemTmp} and ${fallback} both overlap ${fallbackInsideAsset.sourcePath}.`,
+    );
+  }
+  return fallback;
 }
 
 function isLinkUnsupportedError(code: string | undefined): boolean {
@@ -449,7 +499,9 @@ export async function createBackupArchive(
   }
 
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-backup-"));
+  const tempRoot = await chooseBackupTempRoot({ assets: result.assets, outputPath });
+  await fs.mkdir(tempRoot, { recursive: true });
+  const tempDir = await fs.mkdtemp(path.join(tempRoot, "openclaw-backup-"));
   const manifestPath = path.join(tempDir, "manifest.json");
   const tempArchivePath = buildTempArchivePath(outputPath);
   try {
@@ -503,6 +555,7 @@ export async function createBackupArchive(
             gzip: true,
             portable: true,
             preservePaths: true,
+            linkCache: new BackupLinkCache(),
             filter: tarFilter,
             onWriteEntry: (entry) => {
               entry.path = remapArchiveEntryPath({

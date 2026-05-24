@@ -130,6 +130,7 @@ function createCurrentSnapshot(params: {
     ),
     workspaceDir: params.workspaceDir,
     index,
+    registryDiagnostics: [],
     plugins: [
       {
         id: "normalizer",
@@ -218,6 +219,19 @@ describe("manifest model id normalization", () => {
     );
 
     expect(normalizeDemoModel()).toBe("bravo/demo-model");
+  });
+
+  it("reuses workspace-scoped current metadata for unscoped normalization", () => {
+    setCurrentPluginMetadataSnapshot(
+      createCurrentSnapshot({
+        manifestHash: "alpha",
+        prefix: "alpha",
+        workspaceDir: "/workspace/a",
+      }),
+      { config: {}, env: process.env },
+    );
+
+    expect(normalizeDemoModel()).toBe("alpha/demo-model");
   });
 
   it("reflects manifest edits and state-dir changes on the next lookup", () => {

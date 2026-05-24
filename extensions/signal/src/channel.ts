@@ -19,7 +19,7 @@ import {
   createComputedAccountStatusAdapter,
   createDefaultChannelRuntimeState,
 } from "openclaw/plugin-sdk/status-helpers";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveSignalAccount, type ResolvedSignalAccount } from "./accounts.js";
 import { signalApprovalAuth } from "./approval-auth.js";
 import { markdownToSignalTextChunks } from "./format.js";
@@ -148,17 +148,6 @@ function inferSignalTargetChatType(rawTo: string) {
     return "direct" as const;
   }
   return "direct" as const;
-}
-
-function parseSignalExplicitTarget(raw: string) {
-  const normalized = normalizeSignalMessagingTarget(raw);
-  if (!normalized) {
-    return null;
-  }
-  return {
-    to: normalized,
-    chatType: inferSignalTargetChatType(normalized),
-  };
 }
 
 function buildSignalBaseSessionKey(params: {
@@ -308,7 +297,6 @@ export const signalPlugin: ChannelPlugin<ResolvedSignalAccount, SignalProbe> =
       messaging: {
         targetPrefixes: ["signal"],
         normalizeTarget: normalizeSignalMessagingTarget,
-        parseExplicitTarget: ({ raw }) => parseSignalExplicitTarget(raw),
         inferTargetChatType: ({ to }) => inferSignalTargetChatType(to),
         resolveOutboundSessionRoute: (params) => resolveSignalOutboundSessionRoute(params),
         targetResolver: {
@@ -347,7 +335,9 @@ export const signalPlugin: ChannelPlugin<ResolvedSignalAccount, SignalProbe> =
         probeAccount: async ({ account, timeoutMs }) => {
           const baseUrl = account.baseUrl;
           const { probeSignal } = await loadSignalProbeModule();
-          return await probeSignal(baseUrl, timeoutMs);
+          return await probeSignal(baseUrl, timeoutMs, {
+            apiMode: account.config?.apiMode ?? "auto",
+          });
         },
         formatCapabilitiesProbe: ({ probe }) =>
           probe?.version ? [{ text: `Signal daemon: ${probe.version}` }] : [],

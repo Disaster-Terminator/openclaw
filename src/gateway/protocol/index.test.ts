@@ -1,17 +1,24 @@
-import type { ErrorObject } from "ajv";
+import AjvPkg, { type ErrorObject } from "ajv";
 import { describe, expect, it } from "vitest";
 import { TALK_TEST_PROVIDER_ID } from "../../test-utils/talk-test-provider.js";
+import * as protocol from "./index.js";
 import {
   formatValidationErrors,
+  validateChatEvent,
+  validateCommandsListParams,
+  validateConnectParams,
   validateModelsListParams,
   validateNodeEventResult,
+  validateNodePairRequestParams,
   validateNodePresenceAlivePayload,
   validateTasksCancelParams,
   validateTasksListParams,
   validateTalkConfigResult,
   validateTalkEvent,
   validateTalkClientCreateParams,
+  validateTalkClientSteerParams,
   validateTalkClientToolCallParams,
+  validateTalkAgentControlResult,
   validateTalkSessionAppendAudioParams,
   validateTalkSessionCancelOutputParams,
   validateTalkSessionCancelTurnParams,
@@ -19,6 +26,7 @@ import {
   validateTalkSessionJoinParams,
   validateTalkSessionJoinResult,
   validateTalkSessionSubmitToolResultParams,
+  validateTalkSessionSteerParams,
   validateTalkSessionTurnParams,
   validateTalkSessionTurnResult,
   validateWakeParams,
@@ -31,6 +39,71 @@ const makeError = (overrides: Partial<ErrorObject>): ErrorObject => ({
   params: {},
   message: "validation error",
   ...overrides,
+});
+
+type CompileMethod = (schema: unknown, meta?: boolean) => unknown;
+type ProtocolValidator = (value: unknown) => boolean;
+
+describe("lazy protocol validators", () => {
+  it("compiles on first use and reuses the compiled validator", () => {
+    const ajvPrototype = (AjvPkg as unknown as { prototype: { compile: CompileMethod } }).prototype;
+    const originalCompile = ajvPrototype.compile;
+    let compileCalls = 0;
+
+    ajvPrototype.compile = function (this: unknown, schema: unknown, meta?: boolean) {
+      compileCalls += 1;
+      return originalCompile.call(this, schema, meta);
+    };
+
+    try {
+      expect(compileCalls).toBe(0);
+      expect(validateCommandsListParams({})).toBe(true);
+      expect(compileCalls).toBe(1);
+      expect(validateCommandsListParams({ includeArgs: true })).toBe(true);
+      expect(compileCalls).toBe(1);
+    } finally {
+      ajvPrototype.compile = originalCompile;
+    }
+  });
+
+  it("keeps validation errors readable on the exported validator", () => {
+    expect(validateConnectParams({})).toBe(false);
+    expect(formatValidationErrors(validateConnectParams.errors)).toContain("must have required");
+
+    expect(
+      validateConnectParams({
+        minProtocol: 1,
+        maxProtocol: 1,
+        client: {
+          id: "test",
+          version: "1.0.0",
+          platform: "test",
+          mode: "test",
+        },
+      }),
+    ).toBe(true);
+    expect(validateConnectParams.errors).toBeNull();
+  });
+
+  it("can still compile every exported protocol validator", () => {
+    const failures: string[] = [];
+    const validators: Array<[string, ProtocolValidator]> = [];
+    for (const [name, value] of Object.entries(protocol)) {
+      if (name.startsWith("validate") && typeof value === "function") {
+        validators.push([name, value as ProtocolValidator]);
+      }
+    }
+
+    expect(validators.length).toBeGreaterThan(150);
+    for (const [name, validate] of validators) {
+      try {
+        validate(undefined);
+      } catch (err) {
+        failures.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    expect(failures).toEqual([]);
+  });
 });
 
 describe("formatValidationErrors", () => {
@@ -153,6 +226,7 @@ describe("validateTalkConfigResult", () => {
               },
               model: "gpt-realtime",
               voice: "alloy",
+              instructions: "Speak with crisp diction.",
               mode: "realtime",
               transport: "gateway-relay",
               brain: "agent-consult",
@@ -271,6 +345,7 @@ describe("validateTalkSession", () => {
     expect(
       validateTalkSessionCreateParams({
         sessionKey: "agent:main:main",
+        spawnedBy: "agent:main:parent",
         provider: "openai",
         model: "gpt-realtime-2",
         voice: "alloy",
@@ -382,6 +457,44 @@ describe("validateTalkClientToolCallParams", () => {
   });
 });
 
+describe("validateTalkAgentControlParams", () => {
+  it("accepts client and session steering params plus structured outcomes", () => {
+    expect(
+      validateTalkClientSteerParams({
+        sessionKey: "agent:main:main",
+        text: "use the safer path",
+        mode: "steer",
+      }),
+    ).toBe(true);
+    expect(
+      validateTalkSessionSteerParams({
+        sessionId: "talk-1",
+        sessionKey: "agent:main:main",
+        text: "status",
+        mode: "status",
+      }),
+    ).toBe(true);
+    expect(
+      validateTalkAgentControlResult({
+        ok: true,
+        mode: "cancel",
+        sessionKey: "agent:main:main",
+        sessionId: "session-1",
+        active: true,
+        aborted: true,
+        message: "Cancelled the active OpenClaw run.",
+        speak: true,
+        show: true,
+        suppress: false,
+        providerResult: {
+          status: "cancelled",
+          message: "Cancelled the active OpenClaw run.",
+        },
+      }),
+    ).toBe(true);
+  });
+});
+
 describe("validateTalkSessionRelayParams", () => {
   it("accepts session audio, cancel, output cancel, and tool result params", () => {
     expect(
@@ -408,6 +521,7 @@ describe("validateTalkSessionRelayParams", () => {
         sessionId: "session-1",
         callId: "call-1",
         result: { ok: true },
+        options: { suppressResponse: true, willContinue: true },
       }),
     ).toBe(true);
   });
@@ -442,6 +556,53 @@ describe("validateWakeParams", () => {
         anotherExtra: true,
       }),
     ).toBe(true);
+  });
+});
+
+describe("validateChatEvent", () => {
+  it("accepts v4 chat delta text and replacement markers", () => {
+    expect(
+      validateChatEvent({
+        runId: "run-chat",
+        sessionKey: "agent:main:main",
+        seq: 1,
+        state: "delta",
+        deltaText: "hello",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "hello" }],
+        },
+      }),
+    ).toBe(true);
+    expect(
+      validateChatEvent({
+        runId: "run-chat",
+        sessionKey: "agent:main:main",
+        seq: 2,
+        state: "delta",
+        deltaText: "replacement",
+        replace: true,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "replacement" }],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects v3-style chat deltas without deltaText", () => {
+    expect(
+      validateChatEvent({
+        runId: "run-chat",
+        sessionKey: "agent:main:main",
+        seq: 1,
+        state: "delta",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "hello" }],
+        },
+      }),
+    ).toBe(false);
   });
 });
 
@@ -500,6 +661,27 @@ describe("validateNodePresenceAlivePayload", () => {
       validateNodePresenceAlivePayload({
         trigger: "silent_push",
         arbitrary: true,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("validateNodePairRequestParams", () => {
+  it("accepts node pairing permissions", () => {
+    expect(
+      validateNodePairRequestParams({
+        nodeId: "ios-node-1",
+        commands: ["canvas.snapshot"],
+        permissions: { camera: true, notifications: false },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects non-boolean node pairing permissions", () => {
+    expect(
+      validateNodePairRequestParams({
+        nodeId: "ios-node-1",
+        permissions: { camera: "yes" },
       }),
     ).toBe(false);
   });
